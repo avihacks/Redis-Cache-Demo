@@ -1,0 +1,27 @@
+server:
+  port: ${PORT:8080}
+
+spring:
+  datasource:
+    # Local default = in-memory H2. In the cloud, set DB_URL to your Postgres URL.
+    url: ${DB_URL:jdbc:h2:mem:demo;DB_CLOSE_DELAY=-1}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 2s
+      ssl:
+        enabled: ${REDIS_SSL:false}   # Upstash / managed Redis needs true
+
+app:
+  cache-ttl-seconds: ${CACHE_TTL_SECONDS:120}
+  # Artificial delay so you can SEE the speed difference between DB and cache in a demo.
+  simulated-db-latency-ms: ${DB_LATENCY_MS:300}
+  rate-limit-per-minute: ${RATE_LIMIT:30}

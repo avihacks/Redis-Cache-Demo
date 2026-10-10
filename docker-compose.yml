@@ -1,0 +1,14 @@
+# Local Redis (+ optional RedisInsight GUI) for development.
+#   docker compose up -d
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    ports:
+      - "5540:5540"
+    depends_on:
+      - redis
