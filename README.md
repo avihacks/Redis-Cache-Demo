@@ -69,6 +69,57 @@ and the database would take the full load at once (a **cache avalanche**). Rando
 **Why cache "not found"?** Requests for ids that don't exist always miss, so every one would reach the DB
 (**cache penetration**). Storing a `__NULL__` marker for 30 s absorbs that traffic.
 
+## 3b. The same thing with Spring's cache annotations (v2)
+
+Most Spring Boot projects don't write the Redis calls by hand. They use Spring's **cache abstraction**.
+This project has both, side by side, so you can show the manual version (how it works underneath) and the
+annotation version (how it is done in practice):
+
+| | Manual (v1) | Annotations (v2) |
+|---|---|---|
+| Endpoint | `/api/products/{id}` | `/api/v2/products/{id}` |
+| Code | `ProductService` | `CachedProductService` + `CacheConfig` |
+| Redis key | `product:1` | `products::1` |
+
+The pieces:
+
+| Piece | What it does |
+|---|---|
+| `@EnableCaching` (on the main class) | Turns on annotation processing. Without it, the annotations are silently ignored. |
+| `CacheConfig` (RedisCacheManager bean) | Sets the TTL and stores values as JSON instead of Java-serialized binary. |
+| `@CacheConfig(cacheNames = "products")` | Class-level default cache name, so you don't repeat it on every method. |
+| `@Cacheable(key = "#id")` | Hit: return the cached value and skip the method. Miss: run the method, cache the result. |
+| `@CachePut(key = "#id")` | Always run the method, then overwrite the cache entry. Used on updates. |
+| `@CacheEvict(key = "#id")` | Remove one entry. `allEntries = true` clears the whole cache. |
+| `unless = "#result.stock == 0"` | Don't cache a result when this is true (evaluated after the method runs). |
+| `condition = "..."` | (not used here) Only use the cache when this expression on the *inputs* is true. |
+| `@Caching(...)` | (not used here) Combine several cache annotations on one method. |
+| `Serializable` on `Product` | Needed if you use the default Java serialization. We use JSON, but it is kept as good practice. |
+
+How it works: Spring wraps the service in a **proxy**. The proxy checks Redis before your method runs, so the
+body of a `@Cacheable` method only executes on a miss. That is why `getById` logs `>>> CACHE MISS`.
+
+Demo:
+```bash
+curl http://localhost:8080/api/v2/products/1   # slow (miss), look for ">>> CACHE MISS" in the app log
+curl http://localhost:8080/api/v2/products/1   # fast (hit), no log line, body skipped
+curl -X PUT http://localhost:8080/api/v2/products/1 -H "Content-Type: application/json" \
+  -d '{"name":"Keyboard Pro","price":5999,"stock":20}'   # @CachePut refreshes the entry
+curl http://localhost:8080/api/v2/products/1   # fast, and already shows the NEW data
+curl -X DELETE http://localhost:8080/api/v2/products/cache   # @CacheEvict(allEntries = true)
+```
+In `redis-cli`: `KEYS products::*` then `GET products::1` shows the JSON.
+
+**Annotation pitfalls (good interview answers):**
+- *Self-invocation:* calling a `@Cacheable` method from another method **in the same class** bypasses the proxy,
+  so no caching happens. Call it from another bean.
+- *Only public methods* on Spring-managed beans are intercepted.
+- *Return types must match:* if `@Cacheable` stores a `Product` and `@CachePut` stores something else under the same
+  key, later reads break.
+- *No TTL by default:* without `entryTtl` (or `spring.cache.redis.time-to-live`) entries never expire.
+- *`#id` needs parameter names:* Spring Boot's Maven parent compiles with `-parameters`, so it works.
+- *Put annotations on the service layer*, not on controllers.
+
 ## 4. Run it locally
 
 Prerequisites: Java 17+, Maven, and Redis (Docker is easiest).
@@ -229,9 +280,17 @@ Memcached is a simpler multi-threaded string cache.
 count exceeds the limit. `INCR` is atomic, so it is correct across many app instances. It is a *fixed window*
 limiter; it allows bursts at window edges. Sliding window or token bucket (often with a Lua script) is stricter.
 
-**Spring's built-in alternative?** `@Cacheable`, `@CachePut`, `@CacheEvict` with `@EnableCaching` and a
-`RedisCacheManager`. This project writes the logic by hand so each step is visible; in production code
-`@Cacheable` is often the shorter choice.
+**Manual Redis calls vs `@Cacheable`?** This project has both (section 3b). Annotations are shorter and keep caching
+out of business logic. Manual `RedisTemplate` code gives full control: custom TTL per key, jitter, negative caching,
+hit/miss counters, atomic operations like `INCR`. In practice, use annotations for simple read-through caching and
+`RedisTemplate` for anything else (rate limiting, counters, locks, leaderboards).
+
+**Why can a `@Cacheable` method fail to cache?** Self-invocation (the proxy is bypassed), a non-public method,
+a missing `@EnableCaching`, or an exception being thrown (exceptions are not cached).
+
+**Java serialization vs JSON in the cache?** Java serialization needs `Serializable`, produces unreadable binary,
+and breaks when the class changes. JSON (`GenericJackson2JsonRedisSerializer`) is readable in `redis-cli` and
+more tolerant of change.
 
 **What would you do next to productionise this?** Redis failure handling (fall back to the DB if Redis is down),
 metrics (hit ratio in Prometheus/Micrometer), circuit breaker, Redis Sentinel/Cluster for HA, and a distributed
@@ -251,7 +310,10 @@ redis-cache-demo/
         ├── DataSeeder.java            # 5 demo products on first start
         ├── model/Product.java
         ├── repo/ProductRepository.java
-        ├── service/ProductService.java   # <- the heart: cache-aside
+        ├── config/CacheConfig.java       # RedisCacheManager: JSON + TTL (for the annotations)
+        ├── service/ProductService.java   # <- the heart: manual cache-aside
+        ├── service/CachedProductService.java  # same thing with @Cacheable/@CachePut/@CacheEvict
+        ├── web/CachedProductController.java   # /api/v2/products
         ├── service/RateLimiter.java      # INCR + EXPIRE
         ├── service/ProductResult.java
         └── web/ProductController.java
